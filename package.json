@@ -1,0 +1,33 @@
+{
+  "name": "markii-obsidian",
+  "version": "0.5.2",
+  "private": true,
+  "description": "An Obsidian plugin that renders a .mk.md note with @markii/react in a side panel and can run its scripts (network grants, auto-run, scheduled refresh — all device-local). Not the product — see AGENTS.md.",
+  "type": "module",
+  "scripts": {
+    "generate:doc-css": "node scripts/generate-doc-css.ts",
+    "pretest": "npm run generate:doc-css",
+    "test": "vitest run",
+    "prebuild": "npm run generate:doc-css",
+    "build": "tsc --noEmit -p tsconfig.json && node esbuild.config.mjs --production",
+    "watch": "node esbuild.config.mjs --watch",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@markii/bundle": "*",
+    "@markii/core": "*",
+    "@markii/host": "*",
+    "@markii/lua": "*",
+    "@markii/pack": "*",
+    "@markii/react": "*",
+    "@markii/runtime": "*",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.13.1"
+  }
+}
