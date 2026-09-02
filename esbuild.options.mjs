@@ -1,0 +1,655 @@
+/**
+ * One published bundle, one build script:
+ *
+ *   `dist/main.js` — Obsidian expects a plugin's entry to be named exactly
+ *   `main.js` sitting directly in its plugin folder alongside
+ *   `manifest.json` and `styles.css` — but that plugin folder is the
+ *   *installed* location inside a vault
+ *   (`<vault>/.obsidian/plugins/markii/`), not this workspace directory
+ *   itself. Building to `dist/` (rather than dropping `main.js` at the
+ *   workspace root) keeps the generated bundle covered by the repo's
+ *   existing `dist/` ignore/lint-exclusion patterns, the same way every
+ *   other workspace's build output already is; the manual-install steps
+ *   (see the task report) copy `manifest.json`, `styles.css`, and every
+ *   file under `dist/` into that plugin folder. Format `cjs` (Obsidian
+ *   loads a plugin's `main.js` the same way VS Code loads an extension's
+ *   `main`, via `require`), platform `browser` (the plugin runs inside
+ *   Obsidian's renderer process, not a plain Node host), with `obsidian`
+ *   and Electron/Node builtins marked external — Obsidian injects
+ *   `obsidian` itself at runtime, and Electron's own built-ins (plus
+ *   `node:worker_threads`, which `@markii/host`'s `spawnRun` uses
+ *   directly — Obsidian desktop's renderer runs with Node integration,
+ *   exactly like the other Node builtins this bundle already externalizes)
+ *   are never something a plugin bundle should inline.
+ *
+ * `worker.browser.js` — the Web Worker entry for the Run path's
+ * terminatable isolate (`@markii/host`'s `run/worker-entry-browser.ts` —
+ * see AGENTS.md's `packages/markii-host` entry) — is no longer written to
+ * `dist/` as its own file. It is built IN-PROCESS (`buildEmbeddedAssets`
+ * below) and base64-embedded straight into `main.js`, along with wasmoon's
+ * `glue.wasm`. That is a deliberate change from the old two-file-plus-wasm
+ * layout: Obsidian's single-file install channels (BRAT today, the
+ * community plugin catalogue later) fetch only `main.js`, `manifest.json`,
+ * and `styles.css` — a Run path that depended on `worker.browser.js`/
+ * `glue.wasm` being copied alongside those three would silently do nothing
+ * for anyone who installed that way. Embedding the bytes makes a 3-file
+ * install fully functional. See `createMainBuild`'s `embed-runtime-assets`
+ * plugin and `src/run/embedded-assets.ts`/`src/run/browser-worker.ts` for
+ * the decode-and-blob-URL half on the consuming side.
+ *
+ * There is no esbuild-wasm runtime in `dist/` at all: this plugin is
+ * archive-only, with no pack compiler of its own (AGENTS.md's Host
+ * positioning — VS Code is the authoring host and owns pack compilation
+ * and packaging). A pack loads only in its prebuilt form
+ * (`src/packs/pack-context.ts`); a folder with no prebuilt `webview.js` is
+ * skipped, never compiled. So the full `dist/` a build produces is just
+ * `main.js`.
+ *
+ * `@markii/*` resolves to each package's `src/`, exactly like
+ * `scripts/workspace-aliases.config.ts` does for Vite/Vitest, and exactly
+ * like `apps/vscode/esbuild.config.mjs` does for its own bundles: the
+ * published `exports` maps point at `dist/`, which this repo's
+ * `npm run build` (a `tsc --noEmit` typecheck per workspace) deliberately
+ * does not produce. That map cannot be imported from here — it is
+ * TypeScript and this file is plain ESM run by node — so the roots are
+ * repeated below; keep this in sync with `scripts/workspace-aliases.config.ts`
+ * if a package this plugin uses changes location.
+ */
+import {
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { build } from 'esbuild';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(here, '..', '..');
+
+/** Package name -> that package's `src` directory (see the note above). */
+const markiiSrcRoots = {
+  '@markii/core': path.join(repoRoot, 'packages', 'markii-core', 'src'),
+  '@markii/bundle': path.join(repoRoot, 'packages', 'markii-bundle', 'src'),
+  '@markii/runtime': path.join(repoRoot, 'packages', 'markii-runtime', 'src'),
+  '@markii/lua': path.join(repoRoot, 'packages', 'markii-lua', 'src'),
+  '@markii/react': path.join(
+    repoRoot,
+    'packages',
+    'platforms',
+    'markii-react',
+    'src',
+  ),
+  '@markii/host': path.join(repoRoot, 'packages', 'markii-host', 'src'),
+  '@markii/pack': path.join(repoRoot, 'packages', 'markii-pack', 'src'),
+  '@markii/stdlib': path.join(repoRoot, 'packages', 'markii-stdlib', 'src'),
+};
+
+/**
+ * `production` (minify, no sourcemap) keyed off the runner's argv so this
+ * module stays importable with no side effects — the Vitest probe
+ * (`src/run/browser-worker-bundle.probe.test.ts`) imports these exact
+ * options to build and EXECUTE the real worker bundle, which is what keeps
+ * the bundle's worker-safety (no `document`, no Node globals) an executed
+ * check rather than a code-review hope.
+ */
+const args = new Set(process.argv.slice(2));
+const production = args.has('--production');
+/** @type {import('esbuild').BuildOptions} */
+const shared = {
+  bundle: true,
+  logLevel: 'info',
+  minify: production,
+  sourcemap: production ? false : 'inline',
+  alias: markiiSrcRoots,
+};
+
+const embeddedAssetsFile = path.join(here, 'src', 'run', 'embedded-assets.ts');
+const bundledPacksEmbeddedFile = path.join(
+  here,
+  'src',
+  'packs',
+  'bundled-packs-embedded.ts',
+);
+
+/** @type {import('esbuild').BuildOptions} */
+/**
+ * The Run path's isolate, built for a WEB WORKER rather than a worker
+ * thread. Obsidian's Electron renderer refuses `node:worker_threads`
+ * ("The V8 platform used by this instance of Node does not support
+ * creating Workers"), and forking a Node child through
+ * `ELECTRON_RUN_AS_NODE` was measured failing here too, so this is the
+ * only isolate this host can create. `worker-entry-browser.ts` is the
+ * matching entry: it shares `run-job.ts` with the Node worker, and differs
+ * only in getting its network through `@markii/host`'s net bridge (the
+ * HOST performs the pinned request, since a Web Worker has no `node:dns`)
+ * and its `glue.wasm` from a URL.
+ *
+ * `format: 'iife'` because a Web Worker started from a blob URL is a
+ * classic worker, not a module worker. `platform: 'browser'` so nothing
+ * Node-shaped is pulled in; if this bundle ever grows a `node:` import the
+ * build fails here, which is exactly the guard wanted.
+ *
+ * This object is no longer built to a `dist/` file by the runner
+ * (`esbuild.config.mjs`) — it stays exported because the probe
+ * (`src/run/browser-worker-bundle.probe.test.ts`) and `buildEmbeddedAssets`
+ * below both build it themselves, in-process, from these exact options.
+ */
+export const workerBuild = {
+  ...shared,
+  // `decode-named-character-reference` (micromark, via remark-parse) ships a
+  // browser build that calls `document.createElement` AT MODULE TOP LEVEL.
+  // esbuild's `platform: 'browser'` picks that build, but this bundle runs
+  // in a WEB WORKER, where `document` does not exist -- the worker then
+  // throws on load and every run fails before the job even arrives. Alias
+  // it to the package's portable `index.js` (a plain character-entities
+  // map, no DOM), which is exactly what the Node worker bundle already
+  // resolves to via `platform: 'node'`.
+  alias: {
+    ...shared.alias,
+    'decode-named-character-reference': path.join(
+      repoRoot,
+      'node_modules',
+      'decode-named-character-reference',
+      'index.js',
+    ),
+  },
+  entryPoints: [
+    path.join(
+      repoRoot,
+      'packages',
+      'markii-host',
+      'src',
+      'run',
+      'worker-entry-browser.ts',
+    ),
+  ],
+  outfile: path.join(here, 'dist', 'worker.browser.js'),
+  platform: 'browser',
+  format: 'iife',
+  target: 'es2022',
+  // wasmoon's Emscripten bundle carries BOTH environments and picks one at
+  // runtime by sniffing the globals. Obsidian creates its Web Workers WITH
+  // Node integration (`process`, `require`, and `Buffer` all exist inside
+  // them — verified in a real vault: without the mask below, wasmoon takes
+  // its Node path and dies on `import('module')`, which a classic blob
+  // worker cannot resolve). The banner's `var process/Buffer = undefined`
+  // shadows those globals for the whole bundle, so the sniff sees a plain
+  // DedicatedWorkerGlobalScope and takes the browser path both hosts
+  // actually support; the `require` guard likewise shadows the real
+  // integration-provided `require`, so if the Node branch is ever reached
+  // anyway it fails with a sentence rather than doing real Node work.
+  // `url`/`module` stay external so esbuild leaves that (now unreachable)
+  // branch's imports unresolved instead of failing the build.
+  external: ['url', 'module'],
+  banner: {
+    js: "var process = undefined, Buffer = undefined; var require = (m) => { throw new Error('markii: the Lua runtime took its Node code path inside a Web Worker (tried to require ' + m + ')'); };",
+  },
+};
+
+const wasmGluePath = path.join(
+  repoRoot,
+  'node_modules',
+  'wasmoon',
+  'dist',
+  'glue.wasm',
+);
+
+/**
+ * Builds the worker bundle in-process and reads wasmoon's `glue.wasm`,
+ * returning both as base64 ready to embed into `main.js`.
+ *
+ * `overrides` lets the caller layer production flags (`minify`/
+ * `sourcemap`) onto `workerBuild` without mutating the exported object —
+ * `createMainBuild`'s plugin uses this to make the embedded worker match
+ * the main bundle's own production-ness exactly.
+ *
+ * Throws if the worker build produced no output file, or if either
+ * base64 payload comes back empty — a `main.js` that embeds nothing is
+ * indistinguishable from a broken plugin (the Run path just silently
+ * fails), so this is the point the build refuses to succeed rather than
+ * shipping that.
+ */
+export async function buildEmbeddedAssets(overrides = {}) {
+  const result = await build({
+    ...workerBuild,
+    ...overrides,
+    write: false,
+    metafile: true,
+    logLevel: 'silent',
+  });
+  const outputFile = result.outputFiles?.[0];
+  if (!outputFile) {
+    throw new Error(
+      'markii: buildEmbeddedAssets got no output file from the worker build — cannot embed an empty worker bundle into main.js.',
+    );
+  }
+  const workerBundleBase64 = Buffer.from(outputFile.contents).toString(
+    'base64',
+  );
+  if (workerBundleBase64 === '') {
+    throw new Error(
+      'markii: buildEmbeddedAssets produced an empty worker bundle base64 payload.',
+    );
+  }
+
+  const wasmGlueBase64 = readFileSync(wasmGluePath).toString('base64');
+  if (wasmGlueBase64 === '') {
+    throw new Error(
+      'markii: buildEmbeddedAssets read an empty glue.wasm — refusing to embed it into main.js.',
+    );
+  }
+
+  const watchFiles = [
+    ...Object.keys(result.metafile.inputs).map((input) =>
+      path.resolve(repoRoot, input),
+    ),
+    wasmGluePath,
+  ];
+
+  return { workerBundleBase64, wasmGlueBase64, watchFiles };
+}
+
+/**
+ * The three bundled packs (docs/packs.md's "Bundled packs" section, GitHub
+ * issue #15): plain sources at the repo root's `packs/<name>/`, compiled
+ * into the prebuilt form and embedded into `main.js` the same way the
+ * worker bundle above is, so a 3-file BRAT install carries them without
+ * any esbuild-wasm runtime of its own having to run inside Obsidian.
+ */
+const bundledPackFolders = ['read', 'dash', 'prep'].map((name) =>
+  path.join(repoRoot, 'packs', name),
+);
+
+/** A plugin-owned scratch directory for both the compiled pack cache (`@markii/host`'s `buildPackRegistrationScript`) and the throwaway entry module below — never a pack's own folder (AGENTS.md's cleanliness rule), and already covered by the repo's `dist/` ignore pattern. */
+const bundledPacksCacheDir = path.join(here, 'dist', '.bundled-packs-cache');
+
+/**
+ * Source for a tiny ESM module, compiled and then actually EXECUTED (not
+ * just embedded) at build time — the difference from `workerBuild` above,
+ * which is compiled and shipped to run LATER, inside a Web Worker. This
+ * one needs to run NOW, in this Node build process, because building a
+ * pack's registration script (`@markii/host`'s `buildPackRegistrationScript`)
+ * is what actually produces the `webview.js`/`webview.css` bytes to embed.
+ *
+ * It cannot be `node`-executed directly the way `scripts/generate-doc-css.ts`
+ * is (Node's built-in TypeScript stripping resolves bare `@markii/*`
+ * specifiers to that package's `package.json#main`, `./src/index.ts` for
+ * `@markii/host` — but that file's own relative imports use `.js`
+ * specifiers for sibling `.ts` files, a bundler convention Node's plain
+ * ESM resolver does not follow). Bundling it with esbuild first, through
+ * the same `markiiSrcRoots` alias every other build in this file already
+ * uses, sidesteps that entirely — exactly how `main.js`/`worker.browser.js`
+ * themselves resolve `@markii/*`.
+ */
+const bundledPacksEntrySource = `
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import * as path from 'node:path';
+import { parsePackManifest, packComponents } from '@markii/pack';
+import { buildPackRegistrationScript } from '@markii/host';
+
+function collectLuaModules(scriptsDir) {
+  const modules = {};
+  function walk(dir, rel) {
+    if (!existsSync(dir)) return;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const relPath = rel ? rel + '/' + entry.name : entry.name;
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(abs, relPath);
+        continue;
+      }
+      if (!entry.name.endsWith('.lua')) continue;
+      modules[relPath] = readFileSync(abs, 'utf8');
+    }
+  }
+  walk(scriptsDir, '');
+  return modules;
+}
+
+export async function buildBundledPackAssets(packFolders, cacheDir) {
+  const assets = [];
+  for (const folder of packFolders) {
+    const manifestJson = readFileSync(path.join(folder, 'pack.json'), 'utf8');
+    const parsed = parsePackManifest(manifestJson);
+    if (!parsed.ok) {
+      throw new Error(
+        'markii: bundled pack at ' + folder + ' has an invalid manifest: ' +
+          parsed.errors.join('; '),
+      );
+    }
+    const manifest = parsed.manifest;
+    const componentPaths = {};
+    for (const listing of packComponents(manifest)) {
+      componentPaths[listing.localName] = path.join(folder, listing.source);
+    }
+    const outcome = await buildPackRegistrationScript(
+      { folder, manifest, componentPaths },
+      cacheDir,
+    );
+    if (outcome.kind !== 'built') {
+      const reason =
+        outcome.kind === 'failed'
+          ? outcome.reason
+          : 'the pack declares no components';
+      throw new Error(
+        'markii: bundled pack "' + manifest.name + '" failed to build: ' + reason,
+      );
+    }
+    const scriptText = readFileSync(outcome.scriptPath, 'utf8');
+    const cssText =
+      outcome.stylesheetPath !== undefined
+        ? readFileSync(outcome.stylesheetPath, 'utf8')
+        : undefined;
+    const luaModules = collectLuaModules(path.join(folder, 'scripts'));
+    assets.push({ name: manifest.name, manifestJson, scriptText, cssText, luaModules });
+  }
+  return assets;
+}
+`;
+
+/** Every file under `dir`, recursively — the bundled packs' own sources, for watch mode: editing `packs/read/source.tsx` must invalidate the embed the same way editing a worker source file already does. */
+function collectFilesRecursive(dir, out) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const abs = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      collectFilesRecursive(abs, out);
+    } else {
+      out.push(abs);
+    }
+  }
+}
+
+/**
+ * Builds and compiles the three bundled packs, returning the base64 payload
+ * `embed-bundled-packs` (below) substitutes into
+ * `src/packs/bundled-packs-embedded.ts`, plus the full set of source files
+ * to watch.
+ *
+ * Throws — refusing the build, the same posture `buildEmbeddedAssets` takes
+ * for an empty worker payload — when a pack fails to compile, or when the
+ * result does not cover all three configured pack folders: a `main.js`
+ * that silently ships fewer bundled packs than the repo actually has is
+ * exactly the "clean is not silent" violation this pattern exists to
+ * prevent for the worker bundle, and the same standard applies here.
+ */
+export async function buildEmbeddedBundledPacks() {
+  const entryBuild = await build({
+    stdin: {
+      contents: bundledPacksEntrySource,
+      resolveDir: here,
+      sourcefile: 'bundled-packs-entry.js',
+      loader: 'ts',
+    },
+    bundle: true,
+    write: false,
+    platform: 'node',
+    // CommonJS, not ESM: `@markii/host`'s `pack-build.ts` picks HOW to load
+    // esbuild-wasm by checking `typeof require === 'function'` and calling
+    // it with a runtime-computed specifier (`resolveRequire`'s doc
+    // comment). Bundled to ESM, esbuild synthesizes a `require` shim that
+    // satisfies that `typeof` check but throws "Dynamic require ... is not
+    // supported" the moment it is actually called with a non-literal
+    // specifier — confirmed empirically. `.cjs` gives the executed entry a
+    // REAL, ambient Node `require`, so `resolveRequire` takes its normal
+    // branch and the dynamic `require('esbuild-wasm/lib/browser.js')`
+    // resolves exactly the way it already does when this same code runs
+    // inside a packaged VS Code extension's CJS bundle.
+    format: 'cjs',
+    target: 'node22',
+    alias: markiiSrcRoots,
+    external: ['esbuild-wasm'],
+    logLevel: 'silent',
+  });
+  const output = entryBuild.outputFiles?.[0];
+  if (!output) {
+    throw new Error(
+      'markii: buildEmbeddedBundledPacks produced no output for the bundled-packs build entry.',
+    );
+  }
+
+  mkdirSync(bundledPacksCacheDir, { recursive: true });
+  const tempEntryPath = path.join(
+    bundledPacksCacheDir,
+    `entry-${String(process.pid)}-${String(Date.now())}.cjs`,
+  );
+  writeFileSync(tempEntryPath, output.text, 'utf8');
+
+  let assets;
+  try {
+    const mod = await import(pathToFileURL(tempEntryPath).href);
+    const buildBundledPackAssets =
+      mod.buildBundledPackAssets ?? mod.default?.buildBundledPackAssets;
+    if (typeof buildBundledPackAssets !== 'function') {
+      throw new Error(
+        'markii: the bundled-packs build entry did not export buildBundledPackAssets.',
+      );
+    }
+    assets = await buildBundledPackAssets(
+      bundledPackFolders,
+      bundledPacksCacheDir,
+    );
+  } finally {
+    try {
+      unlinkSync(tempEntryPath);
+    } catch {
+      // Best-effort cleanup only; a leftover temp file under the ignored
+      // dist/ cache directory is harmless.
+    }
+  }
+
+  if (!Array.isArray(assets) || assets.length !== bundledPackFolders.length) {
+    throw new Error(
+      'markii: buildEmbeddedBundledPacks did not produce all three bundled packs — refusing to embed a partial set.',
+    );
+  }
+
+  const payloadJson = JSON.stringify(assets);
+  const payloadBase64 = Buffer.from(payloadJson, 'utf8').toString('base64');
+  if (payloadBase64 === '') {
+    throw new Error(
+      'markii: buildEmbeddedBundledPacks produced an empty bundled-packs payload.',
+    );
+  }
+
+  const watchFiles = [];
+  for (const folder of bundledPackFolders) {
+    collectFilesRecursive(folder, watchFiles);
+  }
+
+  return { payloadBase64, watchFiles };
+}
+
+/**
+ * Builds the `dist/main.js` options object fresh each call, with an
+ * esbuild plugin (`embed-runtime-assets`) spliced in that swaps
+ * `src/run/embedded-assets.ts`'s placeholder exports for the real,
+ * base64-encoded worker bundle and `glue.wasm` at build time.
+ *
+ * `onStart` re-runs `buildEmbeddedAssets` on every build, including every
+ * rebuild triggered by watch mode — so a worker-source edit under watch
+ * produces a freshly embedded worker automatically, not a stale one from
+ * the first build. `onLoad`'s `watchFiles` (the worker bundle's own
+ * transitive inputs, plus `glue.wasm`'s path) is what makes esbuild notice
+ * such an edit in the first place and re-trigger that rebuild; without
+ * them, watch mode would only rebuild `main.js` when a file `main.js`
+ * itself imports changes, never when only the worker's sources do.
+ *
+ * This ordering makes a stale embed impossible by construction: `main.js`
+ * is never built from a worker bundle that predates it, because building
+ * the worker bundle is a step INSIDE `main.js`'s own build, not a
+ * separate pass that could run before or after it.
+ */
+export function createMainBuild() {
+  /** @type {{ workerBundleBase64: string; wasmGlueBase64: string; watchFiles: string[] } | undefined} */
+  let embedded;
+  /**
+   * Whether `onLoad` actually swapped `src/run/embedded-assets.ts` this
+   * build. Checked in `onEnd` below, because the failure it guards is
+   * SILENT otherwise: if the filter ever stops matching (the file renamed
+   * or moved, an esbuild change to how `filter`/`namespace` are applied),
+   * esbuild would happily load the real placeholder module, `main.js`
+   * would ship with two empty base64 strings, and every install's Run
+   * button would do nothing at all with no build error to show for it.
+   * That is exactly the mute failure AGENTS.md's "clean is not silent"
+   * rule forbids, so the build refuses instead.
+   */
+  let substituted = false;
+
+  /** @type {import('esbuild').Plugin} */
+  const embedRuntimeAssets = {
+    name: 'embed-runtime-assets',
+    setup(pluginBuild) {
+      pluginBuild.onStart(async () => {
+        substituted = false;
+        embedded = await buildEmbeddedAssets({
+          minify: production,
+          sourcemap: production ? false : 'inline',
+        });
+      });
+      pluginBuild.onLoad(
+        { filter: /embedded-assets\.ts$/, namespace: 'file' },
+        (args) => {
+          if (args.path !== embeddedAssetsFile) return undefined;
+          if (!embedded) {
+            throw new Error(
+              'markii: embed-runtime-assets onLoad ran before onStart populated the embedded bytes.',
+            );
+          }
+          const contents = [
+            `export const EMBEDDED_WORKER_BUNDLE_BASE64 = ${JSON.stringify(
+              embedded.workerBundleBase64,
+            )};`,
+            `export const EMBEDDED_WASM_GLUE_BASE64 = ${JSON.stringify(
+              embedded.wasmGlueBase64,
+            )};`,
+            '',
+          ].join('\n');
+          substituted = true;
+          return { contents, loader: 'ts', watchFiles: embedded.watchFiles };
+        },
+      );
+      pluginBuild.onEnd((result) => {
+        // Only meaningful for a build that otherwise succeeded: a build
+        // that already failed for its own reasons may never have reached
+        // the module at all, and a second, misleading error helps nobody.
+        if (result.errors.length > 0) return;
+        if (substituted) return;
+        return {
+          errors: [
+            {
+              text:
+                'markii: the embed-runtime-assets plugin never substituted src/run/embedded-assets.ts, ' +
+                'so main.js would ship with an empty worker bundle and no Lua wasm. Check that the file ' +
+                'still exists at that path and that the onLoad filter matches it.',
+            },
+          ],
+        };
+      });
+    },
+  };
+
+  /**
+   * Whether `onLoad` substituted `src/packs/bundled-packs-embedded.ts` this
+   * build — the same silent-failure guard `embedRuntimeAssets` above takes
+   * for the worker bundle, applied to the bundled packs' embed instead: a
+   * `main.js` shipping with `EMBEDDED_BUNDLED_PACKS_BASE64` still empty
+   * would silently drop `read`/`dash`/`prep` from every install with no
+   * build error to show for it.
+   */
+  let bundledPacksSubstituted = false;
+  /** @type {{ payloadBase64: string; watchFiles: string[] } | undefined} */
+  let bundledPacksEmbedded;
+
+  /** @type {import('esbuild').Plugin} */
+  const embedBundledPacks = {
+    name: 'embed-bundled-packs',
+    setup(pluginBuild) {
+      pluginBuild.onStart(async () => {
+        bundledPacksSubstituted = false;
+        bundledPacksEmbedded = await buildEmbeddedBundledPacks();
+      });
+      pluginBuild.onLoad(
+        { filter: /bundled-packs-embedded\.ts$/, namespace: 'file' },
+        (args) => {
+          if (args.path !== bundledPacksEmbeddedFile) return undefined;
+          if (!bundledPacksEmbedded) {
+            throw new Error(
+              'markii: embed-bundled-packs onLoad ran before onStart populated the embedded bytes.',
+            );
+          }
+          const contents = [
+            `export const EMBEDDED_BUNDLED_PACKS_BASE64 = ${JSON.stringify(
+              bundledPacksEmbedded.payloadBase64,
+            )};`,
+            '',
+          ].join('\n');
+          bundledPacksSubstituted = true;
+          return {
+            contents,
+            loader: 'ts',
+            watchFiles: bundledPacksEmbedded.watchFiles,
+          };
+        },
+      );
+      pluginBuild.onEnd((result) => {
+        if (result.errors.length > 0) return;
+        if (bundledPacksSubstituted) return;
+        return {
+          errors: [
+            {
+              text:
+                'markii: the embed-bundled-packs plugin never substituted src/packs/bundled-packs-embedded.ts, ' +
+                'so main.js would ship with no bundled read/dash/prep packs. Check that the file still exists ' +
+                'at that path and that the onLoad filter matches it.',
+            },
+          ],
+        };
+      });
+    },
+  };
+
+  return {
+    ...shared,
+    entryPoints: [path.join(here, 'src', 'main.ts')],
+    outfile: path.join(here, 'dist', 'main.js'),
+    platform: 'browser',
+    format: 'cjs',
+    target: 'es2020',
+    jsx: 'automatic',
+    // `esbuild-wasm` stays external even though nothing in this plugin's
+    // runtime calls it any more (no pack compiler here — AGENTS.md's Host
+    // positioning): `@markii/host`'s `src/packs/pack-build.ts`, part of the
+    // shared module graph, still `require()`s it dynamically behind a
+    // runtime check. Marking it external keeps that dynamic require
+    // unresolved at bundle time rather than esbuild trying (and failing, or
+    // bloating the bundle) to inline the whole package; the call itself is
+    // simply never reached from this plugin's own code paths.
+    external: [
+      'obsidian',
+      'electron',
+      'esbuild-wasm',
+      '@codemirror/*',
+      '@lezer/*',
+      'node:*',
+      'fs',
+      'path',
+      'os',
+      'crypto',
+    ],
+    // `@markii/host`'s `src/packs/pack-build.ts` references `import.meta.url`
+    // (guarded by a `typeof require` runtime check) purely for the ESM/
+    // dev-and-Vitest half of that check; the CJS bundle this build produces
+    // never evaluates it. esbuild's warning here is accurate but inert.
+    logOverride: { 'empty-import-meta': 'silent' },
+    plugins: [embedRuntimeAssets, embedBundledPacks],
+  };
+}
