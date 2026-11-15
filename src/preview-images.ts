@@ -1,0 +1,143 @@
+/**
+ * Resolving a note's image sources in the Obsidian preview.
+ *
+ * A note can reference a picture sitting next to it, `:::figure{src="./
+ * test_image.png"}` or plain `![](test_image.png)`. The preview renders
+ * into a React root inside Obsidian's own window, where a relative source
+ * resolves against `app://obsidian.md/`, which holds nothing, so the image
+ * never loads. Obsidian serves a vault file through
+ * `app.vault.adapter.getResourcePath(vaultPath)`, so the fix is to resolve
+ * each schemeless `<img src>` to that URL.
+ *
+ * `createVaultImageResolver` below builds the `resolveImageSrc` resolver
+ * `view.tsx`/`reading-view.ts` hand to `@markii/react`'s `renderMark`: the
+ * renderer resolves each `<img>` as it builds the tree, rather than a DOM
+ * pass rewriting it afterward.
+ *
+ * DECISION, mirroring `apps/vscode/src/webview/document-images.ts`: a
+ * resolver function, NOT a `<base>` element. A `<base>` would change the
+ * resolution of every relative URL in the pane, in-document anchors
+ * included, for the sake of one attribute. `renderMark`'s `resolveImageSrc`
+ * option only ever touches `<img src>`, by construction. It also covers
+ * markdown images and pack components' images for free, since every
+ * component that builds its own `<img>` (the standard `Figure` is the only
+ * one today) receives the same resolver as a prop, rather than something
+ * only this module's own markup would benefit from.
+ *
+ * WHAT A SOURCE MEANS is not decided here. `./vault-image-paths.ts` owns
+ * that, and the export's image embedder walks the same candidate list, so
+ * a note that exports with its pictures intact previews with them too.
+ *
+ * SECURITY: this module resolves, it does not authorize. Every lookup goes
+ * through the vault APIs the host injects, which are jailed to the vault by
+ * construction, and `isVaultRelativePath` is applied to whatever they hand
+ * back, so an absolute filesystem path can never reach `getResourcePath`. A
+ * source that resolves to nothing keeps the value the author wrote: the
+ * image is simply missing, exactly as it is today, and the reason goes to
+ * the diagnostics surface. `renderMark` also re-checks `@markii/core`'s
+ * `isSafeUrl` on whatever this resolver returns, so nothing here needs to
+ * repeat that check.
+ */
+import {
+  isVaultRelativePath,
+  vaultImageCandidates,
+} from './vault-image-paths.js';
+
+/** The three vault-touching calls this module needs, all one-liners in `view.tsx`. Kept as plain functions so everything below stays `obsidian`-free and testable, the same split `./export/export-images.ts` uses. */
+export interface VaultImageResolver {
+  /** `app.metadataCache.getFirstLinkpathDest(src, notePath)?.path`. */
+  readonly linkpathDest: (src: string, notePath: string) => string | undefined;
+  /** True when `vaultPath` names a real file in the vault. */
+  readonly vaultPathExists: (vaultPath: string) => boolean;
+  /** `app.vault.adapter.getResourcePath(vaultPath)`. */
+  readonly resourcePath: (vaultPath: string) => string;
+}
+
+/** Told about a source that named nothing in the vault, for the host's diagnostics surface. Never for a source that was left alone on purpose, such as an `https:` URL. */
+export type UnresolvedImageReporter = (src: string, notePath: string) => void;
+
+/**
+ * The URL Obsidian can serve for `src`, written in the note at `notePath`,
+ * or `undefined` when the source must be left exactly as the author wrote
+ * it. That covers a source with a scheme of its own and a source that names
+ * no file in the vault, which are told apart by the caller through
+ * `vaultImageCandidates` being empty or merely unproductive.
+ */
+export function resolveVaultImageResource(
+  src: string,
+  notePath: string,
+  resolver: VaultImageResolver,
+): string | undefined {
+  for (const candidate of vaultImageCandidates(src, notePath)) {
+    let vaultPath: string | undefined;
+    try {
+      vaultPath =
+        candidate.kind === 'linkpath'
+          ? resolver.linkpathDest(candidate.value, notePath)
+          : resolver.vaultPathExists(candidate.value)
+            ? candidate.value
+            : undefined;
+    } catch {
+      // A vault call that throws is treated as "this candidate found
+      // nothing". A render is never worth breaking over one image.
+      continue;
+    }
+    if (vaultPath === undefined) continue;
+    if (!isVaultRelativePath(vaultPath)) continue;
+    try {
+      return resolver.resourcePath(vaultPath);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Reports each unresolved source once per note for the life of the
+ * preview, writing one line through `log`. The preview re-renders on every
+ * value update and on every save, and a missing image would otherwise write
+ * the same line on every one of them, turning a monitoring note into a
+ * console drip.
+ */
+export function createUnresolvedImageReporter(
+  log: (line: string) => void,
+): UnresolvedImageReporter {
+  const reported = new Set<string>();
+  return (src, notePath) => {
+    const key = `${notePath} ${src}`;
+    if (reported.has(key)) return;
+    reported.add(key);
+    log(
+      `[markii] no file in the vault matches the image source ${src} in ${notePath}`,
+    );
+  };
+}
+
+/**
+ * Builds the `resolveImageSrc` resolver `view.tsx`/`reading-view.ts` hand
+ * to `@markii/react`'s `renderMark`, bound to one note's path and its vault
+ * calls. `renderMark` already skips a source with a scheme, a
+ * protocol-relative form, a bare fragment, or an empty value before ever
+ * calling this, so it only ever sees a value worth asking
+ * `resolveVaultImageResource` about.
+ *
+ * A source `vaultImageCandidates` considers at all, but that resolves to
+ * nothing, is reported once through `onUnresolved` — the same diagnostics
+ * line the old DOM sweep gave — and the source is left exactly as written,
+ * matching `renderMark`'s own "resolver returned nothing" behavior.
+ */
+export function createVaultImageResolver(
+  notePath: string,
+  resolver: VaultImageResolver,
+  onUnresolved?: UnresolvedImageReporter,
+): (src: string) => string | undefined {
+  return (src) => {
+    if (vaultImageCandidates(src, notePath).length === 0) return undefined;
+    const resolved = resolveVaultImageResource(src, notePath, resolver);
+    if (resolved === undefined) {
+      onUnresolved?.(src, notePath);
+    }
+    return resolved;
+  };
+}
